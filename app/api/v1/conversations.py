@@ -1,6 +1,8 @@
+from collections.abc import AsyncIterator
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.sse import EventSourceResponse, ServerSentEvent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -11,10 +13,12 @@ from app.sdk.providers import SUPPORTED_MODELS
 from app.sdk.wrapper import (
     LLMAuthError,
     LLMContextError,
+    LLMError,
     LLMProviderError,
     LLMRateLimitError,
     llm_wrapper,
 )
+from app.ingestion.publisher import publisher
 from app.services import conversation as conversation_service
 from app.services import message as message_service
 
@@ -47,10 +51,7 @@ async def create_conversation(
     body: ConversationCreate,
     db: AsyncSession = Depends(get_db),
 ):
-    conversation = await conversation_service.create_conversation(
-        db, provider=body.provider, model=body.model
-    )
-    return conversation
+    return await conversation_service.create_conversation(db, provider=body.provider, model=body.model)
 
 
 @router.get("/conversations", response_model=list[ConversationResponse])
@@ -80,9 +81,7 @@ async def update_conversation(
     body: ConversationUpdate,
     db: AsyncSession = Depends(get_db),
 ):
-    conversation = await conversation_service.update_conversation(
-        db, conversation_id, status=body.status
-    )
+    conversation = await conversation_service.update_conversation(db, conversation_id, status=body.status)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conversation
@@ -115,13 +114,21 @@ async def list_messages(
     return await message_service.get_messages(db, conversation_id, limit=limit, offset=offset)
 
 
-@router.post("/conversations/{conversation_id}/messages", response_model=SendMessageResponse)
+@router.post("/conversations/{conversation_id}/messages", response_class=EventSourceResponse)
 async def send_message(
     conversation_id: UUID,
     body: SendMessageRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-):
-    # 1. Validate conversation exists and is active.
+) -> AsyncIterator[ServerSentEvent]:
+    """
+    Stream the assistant reply as Server-Sent Events.
+
+    Event types:
+      delta  — {"type": "delta", "content": "<chunk>"}
+      done   — {"type": "done",  "message_id": "...", "usage": {...}, "latency_ms": ...}
+      error  — {"type": "error", "message": "..."}
+    """
     conversation = await conversation_service.get_conversation(db, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -131,54 +138,97 @@ async def send_message(
             detail=f"Cannot send message to a {conversation.status} conversation",
         )
 
-    # 2. Fetch recent history BEFORE saving the new user message so we don't
-    #    include it twice when building the LLM context.
     history = await message_service.get_recent_messages(
         db, conversation_id, limit=settings.max_conversation_history
     )
 
-    # 3. Persist the user message.
     await message_service.create_message(db, conversation_id, role="user", content=body.content)
 
-    # 4. Derive title from the first user message if not set yet.
     if conversation.title is None:
-        await conversation_service.update_conversation(
-            db, conversation_id, title=body.content[:60]
-        )
+        await conversation_service.update_conversation(db, conversation_id, title=body.content[:60])
 
-    # 5. Build the messages array for LiteLLM — history + new turn.
     llm_messages = [{"role": m.role, "content": m.content} for m in history]
     llm_messages.append({"role": "user", "content": body.content})
 
-    # 6. Call the LLM. Map typed errors to appropriate HTTP status codes.
     try:
-        result = await llm_wrapper.chat(
+        chat_stream = await llm_wrapper.stream_chat(
             messages=llm_messages,
             model=conversation.model,
             provider=conversation.provider,
         )
-    except LLMAuthError as e:
-        raise HTTPException(status_code=401, detail=str(e))
-    except LLMRateLimitError as e:
-        raise HTTPException(status_code=429, detail=str(e))
-    except LLMContextError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except LLMProviderError as e:
+    except LLMError as e:
+        await publisher.publish({
+            "conversation_id": conversation_id,
+            "model": conversation.model,
+            "provider": conversation.provider,
+            "status": "error",
+            "latency_ms": e.latency_ms,
+            "input_preview": body.content[:200],
+            "request_at": e.request_at,
+        })
+        if isinstance(e, LLMAuthError):
+            raise HTTPException(status_code=401, detail=str(e))
+        if isinstance(e, LLMRateLimitError):
+            raise HTTPException(status_code=429, detail=str(e))
+        if isinstance(e, LLMContextError):
+            raise HTTPException(status_code=422, detail=str(e))
         raise HTTPException(status_code=502, detail=str(e))
 
-    # 7. Persist the assistant message.
+    try:
+        async for chunk in chat_stream:
+            if await request.is_disconnected():
+                return
+            yield ServerSentEvent(
+                event="delta",
+                data={"type": "delta", "content": chunk},
+            )
+    except LLMError as e:
+        await publisher.publish({
+            "conversation_id": conversation_id,
+            "model": conversation.model,
+            "provider": conversation.provider,
+            "status": "error",
+            "latency_ms": e.latency_ms,
+            "input_preview": body.content[:200],
+            "request_at": e.request_at,
+        })
+        yield ServerSentEvent(event="error", data={"type": "error", "message": str(e)})
+        return
+    except Exception as e:
+        yield ServerSentEvent(event="error", data={"type": "error", "message": f"Unexpected error: {e}"})
+        return
+
+    result = chat_stream.result
     assistant_message = await message_service.create_message(
         db, conversation_id, role="assistant", content=result.content
     )
 
-    # Phase 4: publish inference log to Redis here.
+    await publisher.publish({
+        "conversation_id": conversation_id,
+        "message_id": assistant_message.id,
+        "model": conversation.model,
+        "provider": conversation.provider,
+        "status": "success",
+        "latency_ms": result.latency_ms,
+        "prompt_tokens": result.prompt_tokens,
+        "completion_tokens": result.completion_tokens,
+        "total_tokens": result.total_tokens,
+        "input_preview": body.content[:200],
+        "output_preview": result.content[:200],
+        "request_at": result.request_at,
+        "response_at": result.response_at,
+    })
 
-    return SendMessageResponse(
-        message=MessageResponse.model_validate(assistant_message),
-        usage=TokenUsage(
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
-            total_tokens=result.total_tokens,
-        ),
-        latency_ms=result.latency_ms,
+    yield ServerSentEvent(
+        event="done",
+        data={
+            "type": "done",
+            "message_id": str(assistant_message.id),
+            "usage": {
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "total_tokens": result.total_tokens,
+            },
+            "latency_ms": result.latency_ms,
+        },
     )

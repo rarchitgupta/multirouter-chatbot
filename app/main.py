@@ -2,15 +2,15 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.config import settings
+from app.ingestion.consumer import consumer
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # LiteLLM reads API keys from os.environ at call time, not from our
-    # Settings object, so we push them explicitly on startup.
     if settings.anthropic_api_key:
         os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
     if settings.openai_api_key:
@@ -18,15 +18,22 @@ async def lifespan(app: FastAPI):
     if settings.gemini_api_key:
         os.environ["GEMINI_API_KEY"] = settings.gemini_api_key
 
-    # Phase 4: start Redis ingestion consumer here.
+    await consumer.start()
     yield
-    # Phase 4: stop consumer here.
+    await consumer.stop()
 
 
 app = FastAPI(
     title="LLM Inference Logger",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(api_router)

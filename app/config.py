@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     max_conversation_history: int = 20
+    cors_origins: list[str] = ["http://localhost:3000"]
 
     # LLM providers
     anthropic_api_key: str = ""
