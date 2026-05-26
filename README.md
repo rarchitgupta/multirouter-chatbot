@@ -29,6 +29,33 @@ docker compose up --build
 
 Migrations run automatically on backend startup.
 
+### Kubernetes (self-hosted)
+
+Manifests live in [k8s/](k8s/). Requires an nginx ingress controller.
+
+**1. Build and push images**
+
+```bash
+docker build -t your-registry/llm-logger-api:latest .
+docker build \
+  --build-arg NEXT_PUBLIC_API_URL=http://api.example.com \
+  -t your-registry/llm-logger-web:latest ./client
+docker push your-registry/llm-logger-api:latest
+docker push your-registry/llm-logger-web:latest
+```
+
+**2. Configure**
+
+Edit [k8s/api.yaml](k8s/api.yaml) — fill in your image names and API keys in the `api-keys` Secret. Edit [k8s/ingress.yaml](k8s/ingress.yaml) — replace `example.com` with your domain (or `/etc/hosts` entries for local clusters). Update `CORS_ORIGINS` in the `api-config` ConfigMap to match your frontend domain.
+
+**3. Apply**
+
+```bash
+kubectl apply -k k8s/
+```
+
+Migrations run automatically on API pod startup. The `/ready` probe waits for the database before traffic is routed.
+
 ### Local dev
 
 You'll need [uv](https://docs.astral.sh/uv/) and [bun](https://bun.sh).

@@ -1,0 +1,38 @@
+# Requires nginx ingress controller: https://kubernetes.github.io/ingress-nginx/deploy/
+# The SSE streaming endpoint needs extended timeouts — set via annotations below.
+#
+# Replace example.com with your actual domain (or /etc/hosts entry for local clusters).
+# For local clusters (kind/minikube), add to /etc/hosts:
+#   <node-ip>  app.example.com api.example.com
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-logger
+  namespace: llm-logger
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 3000
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000

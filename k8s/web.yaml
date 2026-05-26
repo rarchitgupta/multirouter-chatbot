@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: llm-logger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          # NEXT_PUBLIC_API_URL is baked at image build time — build with your API domain:
+          # docker build --build-arg NEXT_PUBLIC_API_URL=http://api.example.com \
+          #   -t your-registry/llm-logger-web:latest ./client
+          # docker push your-registry/llm-logger-web:latest
+          image: your-registry/llm-logger-web:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: llm-logger
+spec:
+  selector:
+    app: web
+  ports:
+    - port: 3000
+      targetPort: 3000
