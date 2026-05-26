@@ -1,4 +1,4 @@
-# LLM Inference Logger
+# Multi-router Chatbot
 
 A multi-provider chatbot with real-time inference logging, an async ingestion pipeline, and an observability dashboard.
 
