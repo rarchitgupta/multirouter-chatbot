@@ -25,5 +25,39 @@ services:
       timeout: 3s
       retries: 5
 
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/llm_db
+      REDIS_URL: redis://redis:6379
+      APP_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MAX_CONVERSATION_HISTORY: ${MAX_CONVERSATION_HISTORY:-20}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      REDIS_STREAM_NAME: inference_logs
+      REDIS_STREAM_MAXLEN: "100000"
+      INGESTION_CONSUMER_GROUP: ingestion
+      INGESTION_RETRY_AFTER_MS: "30000"
+      CORS_ORIGINS: '["http://localhost:3000"]'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./client
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
 volumes:
   postgres_data:
